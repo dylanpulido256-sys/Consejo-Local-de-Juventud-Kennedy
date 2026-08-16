@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { supabase } from '../lib/supabase'
@@ -11,47 +11,54 @@ export default function Sesion() {
   const [colaPalabra, setColaPalabra] = useState([])
   const [mociones, setMociones] = useState([])
   const [agenda, setAgenda] = useState([])
+  const [votaciones, setVotaciones] = useState([])
   const [tab, setTab] = useState('inicio')
   const [tipoMocion, setTipoMocion] = useState('orden_dia')
   const [textoMocion, setTextoMocion] = useState('')
   const [enviando, setEnviando] = useState(false)
   const [msg, setMsg] = useState('')
 
+  const cargarDatos = useCallback(async () => {
+    const { data: ses } = await supabase.from('sesiones').select('*').eq('activa', true).maybeSingle()
+    setSesion(ses)
+    if (ses && perfil) {
+      const { data: asis } = await supabase.from('asistencia').select('*').eq('sesion_id', ses.id).eq('consejero_id', perfil.id).maybeSingle()
+      setAsistencia(asis)
+      const { data: cola } = await supabase.from('cola_palabra').select('*, perfiles(nombre, cargo)').eq('sesion_id', ses.id).eq('atendido', false).order('created_at')
+      setColaPalabra(cola || [])
+      const { data: moc } = await supabase.from('mociones').select('*, perfiles(nombre)').eq('sesion_id', ses.id).order('created_at', { ascending: false })
+      setMociones(moc || [])
+      const { data: ag } = await supabase.from('agenda').select('*').eq('sesion_id', ses.id).order('orden')
+      setAgenda(ag || [])
+      const { data: vot } = await supabase.from('votaciones').select('*').eq('sesion_id', ses.id).order('created_at', { ascending: false })
+      setVotaciones(vot || [])
+    } else {
+      setAsistencia(null); setColaPalabra([]); setMociones([]); setAgenda([]); setVotaciones([])
+    }
+  }, [perfil])
+
   useEffect(() => {
-    cargarDatos()
-    const canal = supabase.channel('sesion-live')
+    if (perfil) cargarDatos()
+  }, [perfil, cargarDatos])
+
+  useEffect(() => {
+    const canal = supabase.channel('sesion-live-' + Date.now())
       .on('postgres_changes', { event: '*', schema: 'public', table: 'sesiones' }, cargarDatos)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'cola_palabra' }, cargarDatos)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'mociones' }, cargarDatos)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'asistencia' }, cargarDatos)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'agenda' }, cargarDatos)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'votaciones' }, cargarDatos)
       .subscribe()
     return () => supabase.removeChannel(canal)
-  }, [])
-
-  async function cargarDatos() {
-    const { data: ses } = await supabase.from('sesiones').select('*').eq('activa', true).single()
-    setSesion(ses)
-
-    if (ses && perfil) {
-      const { data: asis } = await supabase.from('asistencia').select('*').eq('sesion_id', ses.id).eq('consejero_id', perfil.id).single()
-      setAsistencia(asis)
-
-      const { data: cola } = await supabase.from('cola_palabra').select('*, perfiles(nombre, cargo)').eq('sesion_id', ses.id).eq('atendido', false).order('created_at')
-      setColaPalabra(cola || [])
-
-      const { data: moc } = await supabase.from('mociones').select('*, perfiles(nombre)').eq('sesion_id', ses.id).order('created_at', { ascending: false })
-      setMociones(moc || [])
-
-      const { data: ag } = await supabase.from('agenda').select('*').eq('sesion_id', ses.id).order('orden')
-      setAgenda(ag || [])
-    }
-  }
+  }, [cargarDatos])
 
   async function registrarAsistencia() {
     if (!sesion || !perfil) return
     setEnviando(true)
-    const { error } = await supabase.from('asistencia').upsert({ sesion_id: sesion.id, consejero_id: perfil.id, presente: true })
-    if (!error) mostrarMsg('✓ Asistencia registrada')
+    await supabase.from('asistencia').upsert({ sesion_id: sesion.id, consejero_id: perfil.id, presente: true })
+    await cargarDatos()
+    mostrarMsg('✓ Asistencia registrada')
     setEnviando(false)
   }
 
@@ -60,22 +67,26 @@ export default function Sesion() {
     const yaEnCola = colaPalabra.find(c => c.consejero_id === perfil.id)
     if (yaEnCola) { mostrarMsg('Ya estás en la cola'); return }
     setEnviando(true)
-    const { error } = await supabase.from('cola_palabra').insert({ sesion_id: sesion.id, consejero_id: perfil.id })
-    if (!error) mostrarMsg('✋ Solicitaste la palabra — posición ' + (colaPalabra.length + 1))
+    await supabase.from('cola_palabra').insert({ sesion_id: sesion.id, consejero_id: perfil.id })
+    await cargarDatos()
+    mostrarMsg('✋ Solicitaste la palabra')
     setEnviando(false)
   }
 
   async function retirarPalabra() {
     if (!sesion || !perfil) return
     await supabase.from('cola_palabra').delete().eq('sesion_id', sesion.id).eq('consejero_id', perfil.id).eq('atendido', false)
+    await cargarDatos()
     mostrarMsg('Retirado de la cola')
   }
 
   async function enviarMocion() {
     if (!sesion || !perfil || !textoMocion.trim()) return
     setEnviando(true)
-    const { error } = await supabase.from('mociones').insert({ sesion_id: sesion.id, consejero_id: perfil.id, tipo: tipoMocion, texto: textoMocion.trim(), estado: 'pendiente' })
-    if (!error) { mostrarMsg('📋 Moción enviada'); setTextoMocion('') }
+    await supabase.from('mociones').insert({ sesion_id: sesion.id, consejero_id: perfil.id, tipo: tipoMocion, texto: textoMocion.trim(), estado: 'pendiente' })
+    await cargarDatos()
+    mostrarMsg('📋 Moción enviada')
+    setTextoMocion('')
     setEnviando(false)
   }
 
@@ -90,7 +101,6 @@ export default function Sesion() {
 
   return (
     <div style={s.page}>
-      {/* Header */}
       <div style={s.header}>
         <div>
           <div style={s.headerTitle}>🏛️ Consejo de Juventud</div>
@@ -102,7 +112,6 @@ export default function Sesion() {
         </div>
       </div>
 
-      {/* Estado sesión */}
       {sesion ? (
         <div style={s.sesionBadge}>
           <span style={s.dot} /> Sesión {sesion.tipo} N° {sesion.numero} en curso
@@ -113,49 +122,42 @@ export default function Sesion() {
         </div>
       )}
 
-      {/* Tabs */}
       <div style={s.tabs}>
-        {[['inicio', '🏠 Inicio'], ['agenda', '📄 Agenda'], ['mociones', '📋 Mociones']].map(([id, label]) => (
+        {[['inicio', '🏠 Inicio'], ['agenda', '📄 Agenda'], ['mociones', '📋 Mociones'], ['votaciones', '🗳️ Votaciones']].map(([id, label]) => (
           <button key={id} onClick={() => setTab(id)} style={{ ...s.tab, ...(tab === id ? s.tabActive : {}) }}>{label}</button>
         ))}
       </div>
 
-      {/* Toast */}
       {msg && <div style={s.toast}>{msg}</div>}
 
-      {/* INICIO */}
       {tab === 'inicio' && (
         <div style={s.content}>
-
-          {/* Asistencia */}
           <div style={s.card}>
             <div style={s.cardTitle}>📍 Mi asistencia</div>
             {asistencia?.presente ? (
               <div style={s.checkRow}><span style={s.check}>✓</span> Asistencia registrada</div>
             ) : (
-              <button onClick={registrarAsistencia} disabled={!sesion || enviando} style={{ ...s.bigBtn, background: sesion ? '#1D9E75' : '#d1d5db' }}>
+              <button onClick={registrarAsistencia} disabled={!sesion || enviando} style={{ ...s.bigBtn, background: sesion ? '#1D9E75' : '#d1d5db', cursor: sesion ? 'pointer' : 'not-allowed' }}>
                 {enviando ? 'Registrando...' : '✓ Registrar mi asistencia'}
               </button>
             )}
           </div>
 
-          {/* Pedir palabra */}
           <div style={s.card}>
             <div style={s.cardTitle}>✋ Pedir la palabra</div>
             {enCola ? (
               <div style={{ textAlign: 'center' }}>
                 <div style={s.posicionNum}>{posicion}</div>
                 <div style={{ color: '#6b7280', fontSize: 14, marginBottom: 12 }}>Tu posición en la cola</div>
-                <button onClick={retirarPalabra} style={s.btnPeligro}>Retirar solicitud</button>
+                <button onClick={retirarPalabra} style={{ ...s.btnPeligro, cursor: 'pointer' }}>Retirar solicitud</button>
               </div>
             ) : (
-              <button onClick={pedirPalabra} disabled={!sesion || enviando} style={{ ...s.bigBtn, background: sesion ? '#2563eb' : '#d1d5db' }}>
+              <button onClick={pedirPalabra} disabled={!sesion || enviando} style={{ ...s.bigBtn, background: sesion ? '#2563eb' : '#d1d5db', cursor: sesion ? 'pointer' : 'not-allowed' }}>
                 {enviando ? 'Enviando...' : '✋ Pedir la palabra'}
               </button>
             )}
           </div>
 
-          {/* Cola actual */}
           <div style={s.card}>
             <div style={s.cardTitle}>👥 Cola de palabra ({colaPalabra.length})</div>
             {colaPalabra.length === 0 ? (
@@ -178,7 +180,6 @@ export default function Sesion() {
         </div>
       )}
 
-      {/* AGENDA */}
       {tab === 'agenda' && (
         <div style={s.content}>
           <div style={s.card}>
@@ -205,7 +206,6 @@ export default function Sesion() {
         </div>
       )}
 
-      {/* MOCIONES */}
       {tab === 'mociones' && (
         <div style={s.content}>
           {sesion && (
@@ -225,12 +225,11 @@ export default function Sesion() {
                 <label style={s.label}>Descripción</label>
                 <textarea value={textoMocion} onChange={e => setTextoMocion(e.target.value)} placeholder="Describe tu moción..." style={s.textarea} rows={3} />
               </div>
-              <button onClick={enviarMocion} disabled={!textoMocion.trim() || enviando} style={{ ...s.bigBtn, background: textoMocion.trim() ? '#7c3aed' : '#d1d5db' }}>
+              <button onClick={enviarMocion} disabled={!textoMocion.trim() || enviando} style={{ ...s.bigBtn, background: textoMocion.trim() ? '#7c3aed' : '#d1d5db', cursor: textoMocion.trim() ? 'pointer' : 'not-allowed' }}>
                 {enviando ? 'Enviando...' : '📋 Enviar moción'}
               </button>
             </div>
           )}
-
           <div style={s.card}>
             <div style={s.cardTitle}>📋 Mociones presentadas</div>
             {mociones.length === 0 ? (
@@ -250,6 +249,53 @@ export default function Sesion() {
               </div>
             )}
           </div>
+        </div>
+      )}
+
+      {tab === 'votaciones' && (
+        <div style={s.content}>
+          {!sesion ? (
+            <div style={s.card}><div style={s.empty}>No hay sesión activa</div></div>
+          ) : votaciones.length === 0 ? (
+            <div style={s.card}><div style={s.empty}>No hay votaciones abiertas aún</div></div>
+          ) : (
+            votaciones.map(v => {
+              const total = v.si + v.no + v.abstencion
+              const pct = n => total ? Math.round((n / total) * 100) : 0
+              return (
+                <div key={v.id} style={s.card}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+                    <div style={{ fontWeight: 700, fontSize: 15 }}>{v.titulo}</div>
+                    <span style={{ ...s.estadoBadge, ...estadoColor(v.estado) }}>{v.estado}</span>
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginBottom: 10 }}>
+                    <div style={{ textAlign: 'center', background: '#d1fae5', borderRadius: 10, padding: 10 }}>
+                      <div style={{ fontSize: 24, fontWeight: 800, color: '#059669' }}>{v.si}</div>
+                      <div style={{ fontSize: 11, color: '#059669' }}>A favor ({pct(v.si)}%)</div>
+                    </div>
+                    <div style={{ textAlign: 'center', background: '#fee2e2', borderRadius: 10, padding: 10 }}>
+                      <div style={{ fontSize: 24, fontWeight: 800, color: '#dc2626' }}>{v.no}</div>
+                      <div style={{ fontSize: 11, color: '#dc2626' }}>En contra ({pct(v.no)}%)</div>
+                    </div>
+                    <div style={{ textAlign: 'center', background: '#f3f4f6', borderRadius: 10, padding: 10 }}>
+                      <div style={{ fontSize: 24, fontWeight: 800, color: '#6b7280' }}>{v.abstencion}</div>
+                      <div style={{ fontSize: 11, color: '#6b7280' }}>Abstención</div>
+                    </div>
+                  </div>
+                  {v.estado === 'abierta' && (
+                    <div style={{ fontSize: 13, color: '#6b7280', textAlign: 'center' }}>
+                      La secretaría está registrando los votos
+                    </div>
+                  )}
+                  {v.estado !== 'abierta' && (
+                    <div style={{ textAlign: 'center', fontWeight: 700, fontSize: 16, color: v.estado === 'aprobado' ? '#059669' : '#dc2626', marginTop: 8 }}>
+                      {v.estado === 'aprobado' ? '✓ APROBADO' : '✗ RECHAZADO'}
+                    </div>
+                  )}
+                </div>
+              )
+            })
+          )}
         </div>
       )}
     </div>
@@ -272,6 +318,7 @@ function estadoColor(estado) {
     en_curso: { background: '#dbeafe', color: '#1e40af' },
     aprobado: { background: '#d1fae5', color: '#065f46' },
     rechazado: { background: '#fee2e2', color: '#991b1b' },
+    abierta: { background: '#dbeafe', color: '#1e40af' },
     atendido: { background: '#e5e7eb', color: '#374151' },
   }
   return m[estado] || {}
@@ -285,15 +332,15 @@ const s = {
   btnAdmin: { padding: '6px 12px', background: 'rgba(255,255,255,0.2)', color: '#fff', border: '1px solid rgba(255,255,255,0.4)', borderRadius: 8, fontSize: 13, cursor: 'pointer' },
   btnSalir: { padding: '6px 12px', background: 'rgba(255,255,255,0.15)', color: '#fff', border: '1px solid rgba(255,255,255,0.3)', borderRadius: 8, fontSize: 13, cursor: 'pointer' },
   sesionBadge: { background: '#d1fae5', color: '#065f46', padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, fontWeight: 500 },
-  dot: { display: 'inline-block', width: 8, height: 8, background: '#10b981', borderRadius: '50', animation: 'pulse 2s infinite' },
+  dot: { display: 'inline-block', width: 8, height: 8, background: '#10b981', borderRadius: '50%' },
   tabs: { display: 'flex', background: '#fff', borderBottom: '1px solid #e5e7eb' },
-  tab: { flex: 1, padding: '12px 8px', fontSize: 13, fontWeight: 500, background: 'none', border: 'none', cursor: 'pointer', color: '#6b7280', borderBottom: '2px solid transparent' },
+  tab: { flex: 1, padding: '12px 4px', fontSize: 12, fontWeight: 500, background: 'none', border: 'none', cursor: 'pointer', color: '#6b7280', borderBottom: '2px solid transparent' },
   tabActive: { color: '#1D9E75', borderBottom: '2px solid #1D9E75' },
   content: { padding: '16px', display: 'flex', flexDirection: 'column', gap: 14 },
   card: { background: '#fff', borderRadius: 14, padding: 16, boxShadow: '0 1px 4px rgba(0,0,0,0.06)' },
   cardTitle: { fontWeight: 700, fontSize: 15, marginBottom: 12, color: '#111827' },
-  bigBtn: { width: '100%', padding: '14px', color: '#fff', border: 'none', borderRadius: 12, fontSize: 16, fontWeight: 700, cursor: 'pointer' },
-  btnPeligro: { padding: '10px 20px', background: '#fee2e2', color: '#dc2626', border: 'none', borderRadius: 10, fontSize: 14, fontWeight: 600, cursor: 'pointer' },
+  bigBtn: { width: '100%', padding: '14px', color: '#fff', border: 'none', borderRadius: 12, fontSize: 16, fontWeight: 700 },
+  btnPeligro: { padding: '10px 20px', background: '#fee2e2', color: '#dc2626', border: 'none', borderRadius: 10, fontSize: 14, fontWeight: 600 },
   checkRow: { display: 'flex', alignItems: 'center', gap: 8, color: '#065f46', fontWeight: 600, fontSize: 15 },
   check: { fontSize: 20, color: '#10b981' },
   posicionNum: { fontSize: 56, fontWeight: 800, color: '#2563eb', textAlign: 'center' },
