@@ -12,10 +12,12 @@ export default function Sesion() {
   const [mociones, setMociones] = useState([])
   const [agenda, setAgenda] = useState([])
   const [votaciones, setVotaciones] = useState([])
+  const [misVotos, setMisVotos] = useState({})
   const [tab, setTab] = useState('inicio')
   const [tipoMocion, setTipoMocion] = useState('orden_dia')
   const [textoMocion, setTextoMocion] = useState('')
   const [enviando, setEnviando] = useState(false)
+  const [votando, setVotando] = useState(null)
   const [msg, setMsg] = useState('')
 
   const cargarDatos = useCallback(async () => {
@@ -32,8 +34,15 @@ export default function Sesion() {
       setAgenda(ag || [])
       const { data: vot } = await supabase.from('votaciones').select('*').eq('sesion_id', ses.id).order('created_at', { ascending: false })
       setVotaciones(vot || [])
+      if (vot && vot.length > 0) {
+        const ids = vot.map(v => v.id)
+        const { data: myVotes } = await supabase.from('votos').select('*').eq('consejero_id', perfil.id).in('votacion_id', ids)
+        const votosMap = {}
+        myVotes?.forEach(v => { votosMap[v.votacion_id] = v.voto })
+        setMisVotos(votosMap)
+      }
     } else {
-      setAsistencia(null); setColaPalabra([]); setMociones([]); setAgenda([]); setVotaciones([])
+      setAsistencia(null); setColaPalabra([]); setMociones([]); setAgenda([]); setVotaciones([]); setMisVotos({})
     }
   }, [perfil])
 
@@ -49,6 +58,7 @@ export default function Sesion() {
       .on('postgres_changes', { event: '*', schema: 'public', table: 'asistencia' }, cargarDatos)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'agenda' }, cargarDatos)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'votaciones' }, cargarDatos)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'votos' }, cargarDatos)
       .subscribe()
     return () => supabase.removeChannel(canal)
   }, [cargarDatos])
@@ -88,6 +98,20 @@ export default function Sesion() {
     mostrarMsg('📋 Moción enviada')
     setTextoMocion('')
     setEnviando(false)
+  }
+
+  async function registrarVoto(votacionId, tipoVoto) {
+    if (!perfil || votando) return
+    setVotando(votacionId)
+    const { error } = await supabase.from('votos').upsert({ votacion_id: votacionId, consejero_id: perfil.id, voto: tipoVoto })
+    if (!error) {
+      await supabase.rpc('actualizar_conteo_votos', { p_votacion_id: votacionId }).catch(() => {})
+      await cargarDatos()
+      mostrarMsg('✓ Voto registrado')
+    } else {
+      mostrarMsg('Ya votaste en esta votación')
+    }
+    setVotando(null)
   }
 
   function mostrarMsg(texto) {
@@ -211,21 +235,17 @@ export default function Sesion() {
           {sesion && (
             <div style={s.card}>
               <div style={s.cardTitle}>➕ Nueva moción</div>
-              <div style={{ marginBottom: 8 }}>
-                <label style={s.label}>Tipo de moción</label>
-                <select value={tipoMocion} onChange={e => setTipoMocion(e.target.value)} style={s.select}>
-                  <option value="orden_dia">Moción de orden del día</option>
-                  <option value="proposicion">Proposición</option>
-                  <option value="proyecto_acuerdo">Proyecto de acuerdo</option>
-                  <option value="receso">Solicitud de receso</option>
-                  <option value="otro">Otro</option>
-                </select>
-              </div>
-              <div style={{ marginBottom: 10 }}>
-                <label style={s.label}>Descripción</label>
-                <textarea value={textoMocion} onChange={e => setTextoMocion(e.target.value)} placeholder="Describe tu moción..." style={s.textarea} rows={3} />
-              </div>
-              <button onClick={enviarMocion} disabled={!textoMocion.trim() || enviando} style={{ ...s.bigBtn, background: textoMocion.trim() ? '#7c3aed' : '#d1d5db', cursor: textoMocion.trim() ? 'pointer' : 'not-allowed' }}>
+              <label style={s.label}>Tipo de moción</label>
+              <select value={tipoMocion} onChange={e => setTipoMocion(e.target.value)} style={s.select}>
+                <option value="orden_dia">Moción de orden del día</option>
+                <option value="proposicion">Proposición</option>
+                <option value="proyecto_acuerdo">Proyecto de acuerdo</option>
+                <option value="receso">Solicitud de receso</option>
+                <option value="otro">Otro</option>
+              </select>
+              <label style={s.label}>Descripción</label>
+              <textarea value={textoMocion} onChange={e => setTextoMocion(e.target.value)} placeholder="Describe tu moción..." style={s.textarea} rows={3} />
+              <button onClick={enviarMocion} disabled={!textoMocion.trim() || enviando} style={{ ...s.bigBtn, background: textoMocion.trim() ? '#7c3aed' : '#d1d5db', cursor: textoMocion.trim() ? 'pointer' : 'not-allowed', marginTop: 8 }}>
                 {enviando ? 'Enviando...' : '📋 Enviar moción'}
               </button>
             </div>
@@ -260,6 +280,7 @@ export default function Sesion() {
             <div style={s.card}><div style={s.empty}>No hay votaciones abiertas aún</div></div>
           ) : (
             votaciones.map(v => {
+              const miVoto = misVotos[v.id]
               const total = v.si + v.no + v.abstencion
               const pct = n => total ? Math.round((n / total) * 100) : 0
               return (
@@ -268,27 +289,47 @@ export default function Sesion() {
                     <div style={{ fontWeight: 700, fontSize: 15 }}>{v.titulo}</div>
                     <span style={{ ...s.estadoBadge, ...estadoColor(v.estado) }}>{v.estado}</span>
                   </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginBottom: 10 }}>
+
+                  {v.estado === 'abierta' && !miVoto && (
+                    <div style={{ marginBottom: 12 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 8, textAlign: 'center' }}>Emite tu voto</div>
+                      <div style={{ display: 'flex', gap: 8 }}>
+                        <button onClick={() => registrarVoto(v.id, 'si')} disabled={votando === v.id} style={{ flex: 1, padding: '14px 8px', background: '#1D9E75', color: '#fff', border: 'none', borderRadius: 12, fontSize: 15, fontWeight: 700, cursor: 'pointer' }}>
+                          ✓ A favor
+                        </button>
+                        <button onClick={() => registrarVoto(v.id, 'no')} disabled={votando === v.id} style={{ flex: 1, padding: '14px 8px', background: '#dc2626', color: '#fff', border: 'none', borderRadius: 12, fontSize: 15, fontWeight: 700, cursor: 'pointer' }}>
+                          ✗ En contra
+                        </button>
+                        <button onClick={() => registrarVoto(v.id, 'abstencion')} disabled={votando === v.id} style={{ flex: 1, padding: '14px 8px', background: '#6b7280', color: '#fff', border: 'none', borderRadius: 12, fontSize: 15, fontWeight: 700, cursor: 'pointer' }}>
+                          — Abs.
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {miVoto && v.estado === 'abierta' && (
+                    <div style={{ background: '#f0fdf4', border: '1px solid #6ee7b7', borderRadius: 10, padding: '10px 14px', marginBottom: 12, textAlign: 'center' }}>
+                      <span style={{ fontWeight: 700, color: '#065f46' }}>✓ Votaste: {miVoto === 'si' ? 'A favor' : miVoto === 'no' ? 'En contra' : 'Abstención'}</span>
+                    </div>
+                  )}
+
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
                     <div style={{ textAlign: 'center', background: '#d1fae5', borderRadius: 10, padding: 10 }}>
-                      <div style={{ fontSize: 24, fontWeight: 800, color: '#059669' }}>{v.si}</div>
+                      <div style={{ fontSize: 22, fontWeight: 800, color: '#059669' }}>{v.si}</div>
                       <div style={{ fontSize: 11, color: '#059669' }}>A favor ({pct(v.si)}%)</div>
                     </div>
                     <div style={{ textAlign: 'center', background: '#fee2e2', borderRadius: 10, padding: 10 }}>
-                      <div style={{ fontSize: 24, fontWeight: 800, color: '#dc2626' }}>{v.no}</div>
+                      <div style={{ fontSize: 22, fontWeight: 800, color: '#dc2626' }}>{v.no}</div>
                       <div style={{ fontSize: 11, color: '#dc2626' }}>En contra ({pct(v.no)}%)</div>
                     </div>
                     <div style={{ textAlign: 'center', background: '#f3f4f6', borderRadius: 10, padding: 10 }}>
-                      <div style={{ fontSize: 24, fontWeight: 800, color: '#6b7280' }}>{v.abstencion}</div>
+                      <div style={{ fontSize: 22, fontWeight: 800, color: '#6b7280' }}>{v.abstencion}</div>
                       <div style={{ fontSize: 11, color: '#6b7280' }}>Abstención</div>
                     </div>
                   </div>
-                  {v.estado === 'abierta' && (
-                    <div style={{ fontSize: 13, color: '#6b7280', textAlign: 'center' }}>
-                      La secretaría está registrando los votos
-                    </div>
-                  )}
+
                   {v.estado !== 'abierta' && (
-                    <div style={{ textAlign: 'center', fontWeight: 700, fontSize: 16, color: v.estado === 'aprobado' ? '#059669' : '#dc2626', marginTop: 8 }}>
+                    <div style={{ textAlign: 'center', fontWeight: 700, fontSize: 16, color: v.estado === 'aprobado' ? '#059669' : '#dc2626', marginTop: 10 }}>
                       {v.estado === 'aprobado' ? '✓ APROBADO' : '✗ RECHAZADO'}
                     </div>
                   )}
@@ -306,12 +347,10 @@ function rolLabel(rol) {
   const m = { consejero: 'Consejero(a)', mesa_directiva: 'Mesa Directiva', secretaria: 'Secretaría' }
   return m[rol] || rol
 }
-
 function tipoMocionLabel(tipo) {
   const m = { orden_dia: 'Orden del día', proposicion: 'Proposición', proyecto_acuerdo: 'Proyecto de acuerdo', receso: 'Receso', otro: 'Otro' }
   return m[tipo] || tipo
 }
-
 function estadoColor(estado) {
   const m = {
     pendiente: { background: '#fef3c7', color: '#92400e' },
@@ -319,11 +358,9 @@ function estadoColor(estado) {
     aprobado: { background: '#d1fae5', color: '#065f46' },
     rechazado: { background: '#fee2e2', color: '#991b1b' },
     abierta: { background: '#dbeafe', color: '#1e40af' },
-    atendido: { background: '#e5e7eb', color: '#374151' },
   }
   return m[estado] || {}
 }
-
 const s = {
   page: { minHeight: '100vh', background: '#f9fafb', paddingBottom: 24 },
   header: { background: '#1D9E75', color: '#fff', padding: '14px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
@@ -352,7 +389,7 @@ const s = {
   agendaNum: { width: 28, height: 28, background: '#1D9E75', color: '#fff', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 13, flexShrink: 0 },
   estadoBadge: { fontSize: 11, fontWeight: 600, padding: '3px 10px', borderRadius: 20 },
   mocionCard: { padding: '12px', border: '1px solid #e5e7eb', borderRadius: 10 },
-  label: { fontSize: 12, fontWeight: 600, color: '#374151', display: 'block', marginBottom: 4 },
+  label: { fontSize: 12, fontWeight: 600, color: '#374151', display: 'block', marginBottom: 4, marginTop: 8 },
   select: { width: '100%', padding: '10px 12px', border: '1.5px solid #e5e7eb', borderRadius: 10, fontSize: 14, marginBottom: 8 },
   textarea: { width: '100%', padding: '10px 12px', border: '1.5px solid #e5e7eb', borderRadius: 10, fontSize: 14, resize: 'vertical' },
   empty: { textAlign: 'center', color: '#9ca3af', fontSize: 14, padding: '20px 0' },
